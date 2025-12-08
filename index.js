@@ -23,13 +23,13 @@ export default function handler(req, res) {
     io = new Server(res.socket.server, {
       path: "/api/socket",
       addTrailingSlash: false,
-      cors: {
-        origin: process.env.CORS_ORIGINS
-          ? process.env.CORS_ORIGINS.split(",").map(s => s.trim())
-          : ["https://videocallhci.vercel.app", "http://localhost:3000", "http://localhost:5173"],
-        methods: ["GET", "POST"],
-        credentials: true
-      }
+        cors: {
+  origin: "*",  // Allow all origins
+  methods: ["GET", "POST"],
+  credentials: true
+}
+
+      
     });
 
     // Save for next invocations
