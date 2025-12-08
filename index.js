@@ -8,7 +8,7 @@ const httpServer = createServer(app);
 
 // Configure CORS
 app.use(cors({
-  origin: '*',
+  origin: true,
   credentials: true
 }));
 
