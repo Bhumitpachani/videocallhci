@@ -17,7 +17,7 @@ app.use(express.json());
 // Socket.IO with CORS
 const io = new Server(httpServer, {
   cors: {
-    origin: '*',
+    origin: true,
     methods: ['GET', 'POST'],
     credentials: true
   }
