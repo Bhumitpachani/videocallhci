@@ -1,201 +1,458 @@
 // server.js
-// Node.js backend for nurse-patient video call system using Express and Socket.io
-// Features: Registration, bidirectional calls, waiting queue, WebRTC signaling, chat, busy status
-// Deployable to Vercel (serverless) or traditional servers
+// Professional Node.js backend for nurse-patient video call system
+// Optimized for Vercel serverless deployment with Socket.io
 
 const express = require('express');
-const http = require('http');
+const { createServer } = require('http');
 const { Server } = require('socket.io');
+const cors = require('cors');
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
+const httpServer = createServer(app);
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Socket.io configuration optimized for Vercel
+const io = new Server(httpServer, {
   cors: {
-    origin: '*', // Restrict to your React app's URL in production
+    origin: process.env.CLIENT_URL || '*',
     methods: ['GET', 'POST'],
+    credentials: true,
   },
-  pingTimeout: 60000, // Helps with serverless environments like Vercel
+  transports: ['websocket', 'polling'],
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  connectTimeout: 45000,
+  allowEIO3: true,
 });
 
-// In-memory storage (use MongoDB/Redis in production)
-const users = {}; // socket.id -> { id: userId, role: 'nurse'|'patient', busy: false }
-const activeCalls = {}; // userId -> partnerId
-const waitingQueue = []; // patientIds waiting for nurse
+// ============================================
+// STATE MANAGEMENT (Use Redis in production)
+// ============================================
 
-// Helper: Find socket.id by userId
-const findSocketByUserId = (userId) => {
-  return Object.keys(users).find((sid) => users[sid].id === userId);
+const state = {
+  users: new Map(), // socketId -> { id, role, busy, socketId }
+  userSockets: new Map(), // userId -> socketId
+  activeCalls: new Map(), // userId -> partnerId
+  waitingQueue: [], // [patientIds]
 };
 
-// Helper: Get formatted online users list
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
+
+const getUserBySocketId = (socketId) => state.users.get(socketId);
+const getUserById = (userId) => {
+  const socketId = state.userSockets.get(userId);
+  return socketId ? state.users.get(socketId) : null;
+};
+
 const getOnlineUsers = () => {
-  return Object.values(users).map((u) => ({
-    id: u.id,
-    role: u.role,
-    busy: u.busy,
+  return Array.from(state.users.values()).map(({ id, role, busy }) => ({
+    id,
+    role,
+    busy,
   }));
 };
 
-// Start a call between two users
-const startCall = (callerId, calleeId) => {
-  const callerSocket = findSocketByUserId(callerId);
-  const calleeSocket = findSocketByUserId(calleeId);
-  if (!callerSocket || !calleeSocket) return;
+const setUserBusy = (userId, busy) => {
+  const user = getUserById(userId);
+  if (user) {
+    user.busy = busy;
+    state.users.set(user.socketId, user);
+  }
+};
 
-  users[callerSocket].busy = true;
-  users[calleeSocket].busy = true;
-  activeCalls[callerId] = calleeId;
-  activeCalls[calleeId] = callerId;
-
-  io.to(calleeSocket).emit('incomingCall', { from: callerId });
+const broadcastOnlineUsers = () => {
   io.emit('onlineUsers', getOnlineUsers());
 };
 
-// End a call and clean up
+const startCall = (callerId, calleeId) => {
+  const caller = getUserById(callerId);
+  const callee = getUserById(calleeId);
+
+  if (!caller || !callee) {
+    return { success: false, error: 'User not found' };
+  }
+
+  setUserBusy(callerId, true);
+  setUserBusy(calleeId, true);
+  state.activeCalls.set(callerId, calleeId);
+  state.activeCalls.set(calleeId, callerId);
+
+  io.to(callee.socketId).emit('incomingCall', {
+    from: callerId,
+    callerRole: caller.role,
+  });
+
+  broadcastOnlineUsers();
+
+  return { success: true };
+};
+
 const endCall = (userId) => {
-  const partnerId = activeCalls[userId];
+  const partnerId = state.activeCalls.get(userId);
   if (!partnerId) return;
 
-  const userSocket = findSocketByUserId(userId);
-  const partnerSocket = findSocketByUserId(partnerId);
+  const user = getUserById(userId);
+  const partner = getUserById(partnerId);
 
-  if (userSocket) users[userSocket].busy = false;
-  if (partnerSocket) {
-    users[partnerSocket].busy = false;
-    io.to(partnerSocket).emit('callEnded', { from: userId });
+  if (user) setUserBusy(userId, false);
+  if (partner) {
+    setUserBusy(partnerId, false);
+    io.to(partner.socketId).emit('callEnded', {
+      from: userId,
+      reason: 'User ended call',
+    });
   }
 
-  delete activeCalls[userId];
-  delete activeCalls[partnerId];
+  state.activeCalls.delete(userId);
+  state.activeCalls.delete(partnerId);
 
   // Notify nurse of next waiting patient
-  const nurseId = users[userSocket]?.role === 'nurse' ? userId : partnerId;
-  if (waitingQueue.length > 0 && nurseId) {
-    const nurseSocket = findSocketByUserId(nurseId);
-    if (nurseSocket) {
-      io.to(nurseSocket).emit('waitingPatient', { patientId: waitingQueue[0] });
-    }
+  if (user?.role === 'nurse' && state.waitingQueue.length > 0) {
+    io.to(user.socketId).emit('waitingPatient', {
+      patientId: state.waitingQueue[0],
+      queueLength: state.waitingQueue.length,
+    });
   }
 
-  io.emit('onlineUsers', getOnlineUsers());
+  broadcastOnlineUsers();
 };
 
-// Socket.io connection handler
+const cleanupUser = (socketId) => {
+  const user = state.users.get(socketId);
+  if (!user) return;
+
+  // End active call
+  if (state.activeCalls.has(user.id)) {
+    endCall(user.id);
+  }
+
+  // Remove from waiting queue
+  const queueIndex = state.waitingQueue.indexOf(user.id);
+  if (queueIndex !== -1) {
+    state.waitingQueue.splice(queueIndex, 1);
+  }
+
+  // Cleanup state
+  state.users.delete(socketId);
+  state.userSockets.delete(user.id);
+
+  broadcastOnlineUsers();
+  console.log(`[CLEANUP] ${user.role} ${user.id} removed`);
+};
+
+// ============================================
+// SOCKET.IO EVENT HANDLERS
+// ============================================
+
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  console.log(`[CONNECT] Socket ${socket.id} connected`);
 
-  // Register user
+  // ============================================
+  // REGISTRATION
+  // ============================================
   socket.on('register', ({ userId, role }) => {
-    if (!userId || !['nurse', 'patient'].includes(role)) {
-      return socket.emit('error', 'Invalid registration');
-    }
-    if (Object.values(users).some((u) => u.id === userId)) {
-      return socket.emit('error', 'User ID already taken');
-    }
-    users[socket.id] = { id: userId, role, busy: false };
-    io.emit('onlineUsers', getOnlineUsers());
-    console.log(`${role} ${userId} registered`);
-  });
-
-  // Initiate call
-  socket.on('callUser', ({ calleeId }) => {
-    const caller = users[socket.id];
-    if (!caller) return socket.emit('error', 'Not registered');
-
-    const calleeSocket = findSocketByUserId(calleeId);
-    if (!calleeSocket) return socket.emit('error', 'Callee offline');
-
-    const callee = users[calleeSocket];
-
-    if (caller.role === callee.role) {
-      return socket.emit('error', 'Cannot call same role');
-    }
-
-    if (callee.busy) {
-      if (caller.role === 'patient' && callee.role === 'nurse') {
-        if (!waitingQueue.includes(caller.id)) {
-          waitingQueue.push(caller.id);
-          io.to(calleeSocket).emit('waitingPatient', { patientId: caller.id });
-        }
-        socket.emit('callWaiting', 'Nurse is busy, added to queue');
-      } else {
-        socket.emit('error', 'Callee is busy');
+    try {
+      // Validation
+      if (!userId || typeof userId !== 'string') {
+        return socket.emit('error', { message: 'Invalid user ID' });
       }
-    } else {
-      startCall(caller.id, callee.id);
-      socket.emit('callStarted', { to: calleeId });
+      if (!['nurse', 'patient'].includes(role)) {
+        return socket.emit('error', { message: 'Invalid role' });
+      }
+
+      // Check if userId already exists
+      if (state.userSockets.has(userId)) {
+        const existingSocketId = state.userSockets.get(userId);
+        // If same socket, ignore
+        if (existingSocketId === socket.id) {
+          return socket.emit('registered', { userId, role });
+        }
+        return socket.emit('error', { message: 'User ID already registered' });
+      }
+
+      // Register user
+      const userData = {
+        id: userId,
+        role,
+        busy: false,
+        socketId: socket.id,
+      };
+
+      state.users.set(socket.id, userData);
+      state.userSockets.set(userId, socket.id);
+
+      socket.emit('registered', { userId, role });
+      broadcastOnlineUsers();
+
+      console.log(`[REGISTER] ${role} ${userId} registered`);
+    } catch (error) {
+      console.error('[REGISTER ERROR]', error);
+      socket.emit('error', { message: 'Registration failed' });
     }
   });
 
-  // Nurse accepts waiting patient
-  socket.on('acceptWaiting', ({ patientId }) => {
-    const nurse = users[socket.id];
-    if (!nurse || nurse.role !== 'nurse') return socket.emit('error', 'Not authorized');
+  // ============================================
+  // CALL INITIATION
+  // ============================================
+  socket.on('callUser', ({ calleeId }) => {
+    try {
+      const caller = getUserBySocketId(socket.id);
+      if (!caller) {
+        return socket.emit('error', { message: 'Not registered' });
+      }
 
-    const queueIndex = waitingQueue.indexOf(patientId);
-    if (queueIndex === -1) return socket.emit('error', 'Patient not waiting');
+      const callee = getUserById(calleeId);
+      if (!callee) {
+        return socket.emit('error', { message: 'User not found or offline' });
+      }
 
-    waitingQueue.splice(queueIndex, 1);
+      // Prevent same-role calls
+      if (caller.role === callee.role) {
+        return socket.emit('error', { message: 'Cannot call users with same role' });
+      }
 
-    const patientSocket = findSocketByUserId(patientId);
-    if (!patientSocket) return socket.emit('error', 'Patient offline');
+      // Check if callee is busy
+      if (callee.busy) {
+        if (caller.role === 'patient' && callee.role === 'nurse') {
+          // Add to waiting queue
+          if (!state.waitingQueue.includes(caller.id)) {
+            state.waitingQueue.push(caller.id);
+            io.to(callee.socketId).emit('waitingPatient', {
+              patientId: caller.id,
+              queueLength: state.waitingQueue.length,
+            });
+          }
+          socket.emit('callWaiting', {
+            message: 'Nurse is busy. You have been added to the queue.',
+            queuePosition: state.waitingQueue.indexOf(caller.id) + 1,
+          });
+        } else {
+          socket.emit('error', { message: 'User is currently busy' });
+        }
+        return;
+      }
 
-    startCall(nurse.id, patientId);
-    io.to(patientSocket).emit('callStarted', { from: nurse.id });
+      // Start call
+      const result = startCall(caller.id, callee.id);
+      if (result.success) {
+        socket.emit('callStarted', { to: calleeId });
+      } else {
+        socket.emit('error', { message: result.error });
+      }
+    } catch (error) {
+      console.error('[CALL USER ERROR]', error);
+      socket.emit('error', { message: 'Failed to initiate call' });
+    }
   });
 
-  // WebRTC signaling
+  // ============================================
+  // ACCEPT WAITING PATIENT (Nurse only)
+  // ============================================
+  socket.on('acceptWaiting', ({ patientId }) => {
+    try {
+      const nurse = getUserBySocketId(socket.id);
+      if (!nurse || nurse.role !== 'nurse') {
+        return socket.emit('error', { message: 'Unauthorized action' });
+      }
+
+      const queueIndex = state.waitingQueue.indexOf(patientId);
+      if (queueIndex === -1) {
+        return socket.emit('error', { message: 'Patient not in queue' });
+      }
+
+      state.waitingQueue.splice(queueIndex, 1);
+
+      const patient = getUserById(patientId);
+      if (!patient) {
+        return socket.emit('error', { message: 'Patient offline' });
+      }
+
+      const result = startCall(nurse.id, patientId);
+      if (result.success) {
+        io.to(patient.socketId).emit('callStarted', {
+          from: nurse.id,
+          role: nurse.role,
+        });
+      }
+    } catch (error) {
+      console.error('[ACCEPT WAITING ERROR]', error);
+      socket.emit('error', { message: 'Failed to accept patient' });
+    }
+  });
+
+  // ============================================
+  // WEBRTC SIGNALING
+  // ============================================
   socket.on('offer', ({ offer, to }) => {
-    const toSocket = findSocketByUserId(to);
-    if (toSocket) io.to(toSocket).emit('offer', { offer, from: users[socket.id].id });
+    try {
+      const from = getUserBySocketId(socket.id);
+      const target = getUserById(to);
+
+      if (!from || !target) return;
+
+      io.to(target.socketId).emit('offer', {
+        offer,
+        from: from.id,
+      });
+    } catch (error) {
+      console.error('[OFFER ERROR]', error);
+    }
   });
 
   socket.on('answer', ({ answer, to }) => {
-    const toSocket = findSocketByUserId(to);
-    if (toSocket) io.to(toSocket).emit('answer', { answer, from: users[socket.id].id });
+    try {
+      const from = getUserBySocketId(socket.id);
+      const target = getUserById(to);
+
+      if (!from || !target) return;
+
+      io.to(target.socketId).emit('answer', {
+        answer,
+        from: from.id,
+      });
+    } catch (error) {
+      console.error('[ANSWER ERROR]', error);
+    }
   });
 
   socket.on('ice-candidate', ({ candidate, to }) => {
-    const toSocket = findSocketByUserId(to);
-    if (toSocket) io.to(toSocket).emit('ice-candidate', { candidate, from: users[socket.id].id });
+    try {
+      const from = getUserBySocketId(socket.id);
+      const target = getUserById(to);
+
+      if (!from || !target) return;
+
+      io.to(target.socketId).emit('ice-candidate', {
+        candidate,
+        from: from.id,
+      });
+    } catch (error) {
+      console.error('[ICE CANDIDATE ERROR]', error);
+    }
   });
 
-  // Chat message
+  // ============================================
+  // CHAT MESSAGES
+  // ============================================
   socket.on('chatMessage', ({ message, to }) => {
-    const from = users[socket.id]?.id;
-    if (!from) return;
-    const toSocket = findSocketByUserId(to);
-    if (toSocket) io.to(toSocket).emit('chatMessage', { message, from });
+    try {
+      const from = getUserBySocketId(socket.id);
+      const target = getUserById(to);
+
+      if (!from || !target) return;
+
+      io.to(target.socketId).emit('chatMessage', {
+        message,
+        from: from.id,
+        timestamp: Date.now(),
+      });
+    } catch (error) {
+      console.error('[CHAT MESSAGE ERROR]', error);
+    }
   });
 
-  // End call
+  // ============================================
+  // END CALL
+  // ============================================
   socket.on('endCall', ({ to }) => {
-    const from = users[socket.id]?.id;
-    if (from && activeCalls[from] === to) {
-      endCall(from);
+    try {
+      const from = getUserBySocketId(socket.id);
+      if (!from) return;
+
+      if (state.activeCalls.get(from.id) === to) {
+        endCall(from.id);
+      }
+    } catch (error) {
+      console.error('[END CALL ERROR]', error);
     }
   });
 
-  // Disconnect cleanup
+  // ============================================
+  // GET WAITING QUEUE (Nurse only)
+  // ============================================
+  socket.on('getWaitingQueue', () => {
+    try {
+      const user = getUserBySocketId(socket.id);
+      if (!user || user.role !== 'nurse') return;
+
+      socket.emit('waitingQueue', {
+        queue: state.waitingQueue,
+        length: state.waitingQueue.length,
+      });
+    } catch (error) {
+      console.error('[GET QUEUE ERROR]', error);
+    }
+  });
+
+  // ============================================
+  // DISCONNECT
+  // ============================================
   socket.on('disconnect', () => {
-    const user = users[socket.id];
-    if (user) {
-      endCall(user.id);
-      const queueIndex = waitingQueue.indexOf(user.id);
-      if (queueIndex !== -1) waitingQueue.splice(queueIndex, 1);
-      delete users[socket.id];
-      io.emit('onlineUsers', getOnlineUsers());
-      console.log(`${user.role} ${user.id} disconnected`);
-    }
+    console.log(`[DISCONNECT] Socket ${socket.id} disconnected`);
+    cleanupUser(socket.id);
   });
 });
 
-// Health check for deployment
-app.get('/', (req, res) => res.json({ status: 'Server running' }));
+// ============================================
+// REST API ENDPOINTS
+// ============================================
 
-// Start server
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/`);
+// Health check
+app.get('/', (req, res) => {
+  res.json({
+    status: 'running',
+    timestamp: new Date().toISOString(),
+    service: 'Nurse-Patient Video Call System',
+  });
 });
+
+// Get server statistics
+app.get('/api/stats', (req, res) => {
+  res.json({
+    onlineUsers: state.users.size,
+    activeCalls: state.activeCalls.size / 2,
+    waitingQueue: state.waitingQueue.length,
+    nurses: Array.from(state.users.values()).filter((u) => u.role === 'nurse').length,
+    patients: Array.from(state.users.values()).filter((u) => u.role === 'patient').length,
+  });
+});
+
+// Get online users (requires auth in production)
+app.get('/api/users', (req, res) => {
+  res.json({
+    users: getOnlineUsers(),
+  });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('[ERROR]', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// ============================================
+// SERVER START
+// ============================================
+
+const PORT = process.env.PORT || 3001;
+
+if (process.env.NODE_ENV !== 'production') {
+  httpServer.listen(PORT, () => {
+    console.log(`
+╔═══════════════════════════════════════════════════════╗
+║  🏥 Nurse-Patient Video Call System                  ║
+║  Server running on port ${PORT}                         ║
+║  Health: http://localhost:${PORT}                       ║
+║  Stats: http://localhost:${PORT}/api/stats              ║
+╚═══════════════════════════════════════════════════════╝
+    `);
+  });
+}
+
+// Export for Vercel
+module.exports = httpServer;
